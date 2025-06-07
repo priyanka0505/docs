@@ -1,0 +1,2007 @@
+package events
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"reflect"
+	"strconv"
+	"strings"
+
+	"github.build.ge.com/Digital-Asset-Passport/1fa-events-dx-processor/common/db"
+	"github.build.ge.com/Digital-Asset-Passport/1fa-events-dx-processor/common/structs"
+	"github.build.ge.com/Digital-Asset-Passport/1fa-events-dx-processor/common/utilities"
+
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+)
+
+var (
+	eventNumber     string
+	entitySourceKey string
+	logger          zerolog.Logger
+	dataRepo        *db.Repo
+	err             error
+)
+
+func ProcessEvents(fileBody []byte) error {
+	//read and parse the json file
+	var newSnapShot structs.EventSnapshotDetailResponse
+
+	err := json.Unmarshal(fileBody, &newSnapShot)
+	if err != nil {
+		log.Error().Err(err).Str("FileBody", string(fileBody)).Msg("Failed to unmarshal JSON from S3 object")
+		return err
+	}
+
+	//fetch exisiting snapshot from DB
+	exisitingJSON, err := dataRepo.GetEventSnapshotByNumber(newSnapShot.EventNumber)
+	log.Info().Interface("exisitingJson", exisitingJSON).Msg("DB snapshot response for exisiting EventNumber")
+	var oldEventSnapshot structs.EventSnapshotDetailResponse
+	if err != nil {
+		log.Error().Err(err).Interface("details", err).Msgf("Failed to get event snapshot details for an event %s", newSnapShot.ExtEventNumber)
+		return err
+	}
+	if str, ok := exisitingJSON.(string); ok && str != "" {
+		err = json.Unmarshal([]byte(str), &oldEventSnapshot)
+		if err != nil {
+			log.Error().Err(err).Interface("details", err).Msgf("Failed to unmarshall event snapshot details for an event %s", newSnapShot.ExtEventNumber)
+			return err
+		}
+		eventNumber = oldEventSnapshot.EventNumber
+		entitySourceKey = oldEventSnapshot.EntitySourceKey
+
+	}
+	log.Info().Interface("newSnapShot", newSnapShot).Msg("DB snapshot response for  EventNumber from user: ")
+	log.Info().Interface("oldEventSnapshot", oldEventSnapshot).Msg(oldEventSnapshot.EventNumber)
+
+	//step 3: Compare new json and old json
+	created, updated, deleted := compareEventSnapshotDetail(newSnapShot, oldEventSnapshot)
+	log.Info().Interface("created", created).Msg("Creating new events and sub-events")
+
+	//Step 4: Insert/Update/Delete from db based on step 3
+	if len(created) > 0 {
+		log.Info().Msg("Processing created records")
+		if err := handleCreatedRecords(created, newSnapShot); err != nil {
+			return err
+		}
+	}
+	log.Info().Interface("updated", updated).Msg("Updating new events and sub-events")
+
+	if len(updated) > 0 {
+		log.Info().Msg("Processing updated records")
+		if err := handleUpdatedRecords(updated, newSnapShot); err != nil {
+			return err
+		}
+	}
+	log.Info().Interface("deleted", deleted).Msg("deleting  events and sub-events")
+
+	if len(deleted) > 0 {
+		log.Info().Msg("Processing updated records")
+		if err := handleDeletedRecords(deleted, oldEventSnapshot); err != nil {
+			return err
+		}
+	}
+
+	log.Info().Msg("Complete ...")
+
+	return nil
+}
+func compareEventSnapshotDetail(newEventSnapshot structs.EventSnapshotDetailResponse, oldEventSnapshot structs.EventSnapshotDetailResponse) (created, updated, deleted map[string]interface{}) {
+	log.Info().Msg("Starting comparison of event snapshot details")
+
+	// Convert struct to map for newData
+	log.Info().Msg("Converting newEventSnapshot to map")
+	newEventSnapshotMap, err := utilities.StructToMap(newEventSnapshot)
+	if err != nil {
+		log.Error().Err(err).Msg("Error converting newEventSnapshot to map")
+		return
+	}
+	log.Info().Interface("NewEventSnapshotMap", newEventSnapshotMap).Msg("Successfully converted newEventSnapshot to map")
+
+	// Convert struct to map for oldData
+	log.Info().Msg("Converting oldEventSnapshot to map")
+	oldEventSnapshotMap, err := utilities.StructToMap(oldEventSnapshot)
+	if err != nil {
+
+		log.Error().Err(err).Msg("Error converting oldEventSnapshot to map")
+		return
+	}
+	log.Info().Interface("OldEventSnapshotMap", oldEventSnapshotMap).Msg("Successfully converted oldEventSnapshot to map")
+
+	// Compare the data
+	log.Info().Msg("Starting comparison of converted maps")
+	created, updated, deleted = utilities.CompareJSON(oldEventSnapshotMap, newEventSnapshotMap)
+
+	// Log the results of the comparison
+	log.Info().Interface("Created", created).Interface("Updated", updated).Interface("Deleted", deleted).Msg("Comparison results")
+	return created, updated, deleted
+}
+
+// handleCreatedRecords func process creation  for  event and  sub-attribute's
+func handleCreatedRecords(created map[string]interface{}, eReq structs.EventSnapshotDetailResponse) error {
+	log.Info().Msg("Starting to process elements for event creation")
+
+	// Step 1: Filter non-slice fields from the `created` map
+	nonSliceElementMap := map[string]interface{}{}
+	for key, value := range created {
+		if value != nil && reflect.TypeOf(value).Kind() != reflect.Slice {
+			nonSliceElementMap[key] = value
+		}
+	}
+
+	// Step 2: Process non-slice fields (if any)
+	if len(nonSliceElementMap) > 0 {
+		newEventStruct := mapToEventStruct(nonSliceElementMap)
+
+		var eventID int64
+		var entityID int64
+		// Check for duplicate event in the database
+		isDuplicate := false
+		if !isDuplicate {
+			existIDMap, err := dataRepo.GetEventIDByNumber(eReq.EventNumber)
+			if err == nil {
+				idValue, exists := existIDMap["id"]
+				if exists {
+					eventsID, ok := idValue.(int64)
+					if ok {
+						eReq.EventID = eventsID
+						log.Info().Str("EventNumber", newEventStruct.EventNumber).Int64("EventID", eventID).Msg("Event already exists, using existing event ID for subevents")
+						isDuplicate = true
+					}
+				}
+			}
+		}
+
+		// Fetch entity ID and integrate it into the event struct
+		entityID, err := fetchEntityID(newEventStruct.EntitySourceKey)
+		if err != nil {
+			log.Error().AnErr("DB Error", err).Msg("Failed to fetch entity ID using EntitySourceKey")
+			return err
+		}
+
+		// Prepare the payload for the API call
+		eventPayload := make(map[string]interface{})
+		for key, value := range nonSliceElementMap {
+			eventPayload[key] = value
+		}
+		eventPayload["entityId"] = entityID
+		eventPayload["comment"] = eReq.Remark
+		eventPayload["station"] = eReq.StationCode
+		eventPayload["extEventNumber"] = eReq.EventNumber
+		eventPayload["eventNumber"] = eReq.EventNumber
+
+		// Step 6: Check for file attachments
+		if value, exists := created["fileAttachment"]; exists {
+			log.Info().Msgf("Processing fileAttachments for event ID: %d", eReq.EventID)
+
+			var attachments []structs.EventAttachment
+			for i, attachment := range value.([]interface{}) {
+				attachmentMap, ok := attachment.(map[string]interface{})
+				if !ok {
+					log.Error().Msgf("Invalid attachment format at index %d: %+v", i, attachment)
+					continue
+				}
+				// Map the attachment map to the `EventAttachment` struct
+				newAttachmentStruct, err := mapToFileAttachementStruct(attachmentMap)
+				if err != nil {
+					log.Error().Err(err).Msgf("Failed to map fileAttachment at index %d", i)
+					continue
+				}
+
+				attachments = append(attachments, newAttachmentStruct)
+			}
+
+			// Add attachments to the payload if any are found
+			if len(attachments) > 0 {
+				eventPayload["attachments"] = attachments
+				log.Info().Interface("Processing fileAttachments for event ID: ", eventPayload["fileAttachment"])
+
+			}
+
+		}
+
+		// Marshal the payload to JSON
+		finalPayload, err := json.Marshal(eventPayload)
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to marshal final payload")
+			return err
+		}
+
+		log.Info().Msg("FinalPayload: " + string(finalPayload))
+
+		// Construct the API call
+		eventBaseURL := os.Getenv("EVENT_REQUEST_BASE_URL")
+		eventsURI := os.Getenv("eventsURI")
+		if eventBaseURL == "" || eventsURI == "" {
+			log.Error().Msg("Missing required environment variables")
+			return nil
+		}
+		eventURI := eventBaseURL + eventsURI
+		eventRequest := utilities.ConstructRequest(string(finalPayload), eventURI, "POST")
+
+		// Make the API call
+		response, err := utilities.MakeAPICall(eventRequest)
+		if err != nil {
+			log.Error().AnErr("Service Error from Events API", err).Msg("Failed to create event")
+			return err
+		}
+
+		log.Info().Msgf("API response: %s", string(response))
+
+		// Handle API response and parse event ID
+		var apiErrResp structs.APIFailure
+		if err := json.Unmarshal(response, &apiErrResp); err == nil && apiErrResp.ErrorMessage != "" {
+			log.Error().Msg("API returned an error response")
+			return fmt.Errorf("API error: %s", apiErrResp.ErrorMessage)
+		}
+	} else {
+		eventID, err := getEventID(eventNumber)
+		if err != nil {
+			log.Error().Err(err).Msgf("Failed to fetch EventID for EventNumber: %s", eReq.EventNumber)
+			return err
+		}
+		eReq.EventID = eventID
+
+		entityID, err := fetchEntityID(eReq.EntitySourceKey)
+		if err != nil {
+			log.Error().AnErr("DB Error", err).Msg("Failed to fetch EntityID using EntitySourceKey")
+			return err
+		}
+		eReq.EntityID = entityID
+	}
+
+	// Step 3: Process slice fields (e.g., shopVisit, sideEffect, etc.)
+	for key, value := range created {
+		if reflect.TypeOf(value).Kind() == reflect.Slice {
+			log.Info().Msgf("Processing sub-events for key: %s", key)
+			switch key {
+			case "shopVisit":
+				log.Info().Msgf("Creating records for key: %s", key)
+
+				for i, shopVisit := range value.([]interface{}) {
+					shopVisitMap, ok := shopVisit.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid shopVisit at index %d", i)
+						continue
+					}
+
+					shopVisitMap["entityId"] = eReq.EntityID
+					shopVisitMap["eventId"] = eReq.EventID
+
+					log.Info().Msgf("Creating shopVisit at index %d", i)
+					newShopVisitStruct, err := mapToShopVisitStruct(shopVisitMap)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to map shopVisit")
+						return err
+					}
+					shopVisitPayload, err := json.Marshal(newShopVisitStruct)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to marshal shopVisit payload")
+						return err
+					}
+					shopVisitURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.Itoa(int(eReq.EventID)) + "/shopvisit"
+					shopVisitRequest := utilities.ConstructRequest(string(shopVisitPayload), shopVisitURI, "POST")
+
+					response, err := utilities.MakeAPICall(shopVisitRequest)
+					if err != nil {
+						log.Error().AnErr("Service Error from ShopVisit API", err).Msgf("Failed to create shopVisit at index %d", i)
+					} else {
+						log.Info().Msg("Triggered shopVisit API successfully. Response = " + string(response))
+					}
+				}
+			case "sideEffect":
+				log.Info().Msgf("Processing sideEffects for event ID: %d", eReq.EventID)
+
+				// Get the sideEffect IDs map from DB (keyed by name)
+				sideEffectIDsMap, err := getSideEffectIdsFromDB()
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to get sideEffect IDs from DB")
+					return err
+				}
+
+				for i, sideEffect := range value.([]interface{}) {
+					sideEffectMap, ok := sideEffect.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid sideEffect format at index %d", i)
+						return nil
+					}
+
+					name, nameOk := sideEffectMap["name"].(string)
+					if !nameOk {
+						log.Error().Msgf("Missing name field in sideEffect at index %d", i)
+						return nil
+					}
+
+					key := strings.TrimSpace(name)
+
+					if id, found := sideEffectIDsMap[key]; found {
+						sideEffectMap["sideEffectId"] = id
+					} else {
+						log.Warn().Msgf("SideEffect ID not found for name '%s' at index %d", key, i)
+						continue // or return error if strict enforcement needed
+					}
+
+					sideEffectMap["eventId"] = eReq.EventID
+
+					// Check for duplicate
+					if sid, ok := sideEffectMap["sideEffectId"].(int); ok {
+						log.Debug().Msgf("Checking for existing sideEffect with ID %d for event ID %d", sid, eReq.EventID)
+						existing, err := dataRepo.GetSideEffectByEventID(int(eReq.EventID), sid)
+						if err != nil {
+							log.Error().Err(err).Msgf("Failed to check existing sideEffect with ID %d", sid)
+							return err
+						}
+						if existing != nil {
+							log.Info().Msgf("SideEffect with ID %d already exists for event %d, skipping", sid, eReq.EventID)
+							continue
+						}
+					}
+
+					newSideEffectStruct, err := mapToSideEffectStruct(sideEffectMap)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to map sideEffect")
+						return err
+					}
+
+					sideEffectPayload, err := json.Marshal(newSideEffectStruct)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to marshal sideEffect payload")
+						return err
+					}
+
+					sideEffectURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.Itoa(int(eReq.EventID)) + "/sideEffects"
+					sideEffectRequest := utilities.ConstructRequest(string(sideEffectPayload), sideEffectURI, "POST")
+
+					response, err := utilities.MakeAPICall(sideEffectRequest)
+					if err != nil {
+						log.Error().AnErr("Service Error from SideEffect API", err).Msgf("Failed to create sideEffect at index %d", i)
+					} else {
+						log.Info().Msgf("Triggered SideEffect API successfully for index %d. Response = %s", i, string(response))
+					}
+				}
+
+			case "symptom":
+				log.Info().Msgf("Processing symptoms for event ID: %d", eReq.EventID)
+
+				// Fetch master data map before the loop
+				symptomIDsMap, err := getSymptomIdsFromDB()
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to get symptom master data")
+					return err
+				}
+
+				// Fetch already existing event-linked symptoms
+				existingSymptomMap, err := getSymptomsMasterData(strconv.Itoa(int(eReq.EventID)))
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to fetch existing symptoms for event")
+					return err
+				}
+
+				for i, symptom := range value.([]interface{}) {
+					symptomMap, ok := symptom.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid symptom at index %d", i)
+						continue
+					}
+
+					// Extract symptom fields
+					category, catOk := symptomMap["category"].(string)
+					name, nameOk := symptomMap["name"].(string)
+					modifier := symptomMap["modifier"] // could be float64 if from JSON
+
+					if !catOk || !nameOk || modifier == nil {
+						log.Warn().Msgf("Missing or invalid symptom fields at index %d: %+v", i, symptomMap)
+						continue // Skip this symptom if required fields are missing or invalid
+					}
+
+					// Convert modifier to int
+					var modifierInt int
+					switch v := modifier.(type) {
+					case float64:
+						modifierInt = int(v)
+					case int:
+						modifierInt = v
+					case string:
+						parsed, err := strconv.Atoi(v)
+						if err != nil {
+							log.Warn().Msgf("Invalid modifier string at index %d: %s", i, v)
+							continue // Skip this symptom if modifier is invalid
+						}
+						modifierInt = parsed
+					default:
+						log.Warn().Msgf("Invalid type for modifier at index %d: %+v", i, modifier)
+						continue // Skip this symptom if modifier type is invalid
+					}
+
+					// Lookup symptomId from master list using category, name, and modifier
+					key := fmt.Sprintf("%s_%s_%d", category, name, modifierInt)
+					symptomID, found := symptomIDsMap[key]
+					if !found {
+						log.Warn().Msgf("No matching symptomId found for key: %s at index %d", key, i)
+						continue // Skip this symptom if no matching ID is found
+					}
+
+					symptomMap["symptomId"] = symptomID
+					symptomMap["eventID"] = eReq.EventID
+
+					// Construct composite key to check for duplicates
+					compositeKey := fmt.Sprintf("%d_%d", eReq.EventID, symptomID)
+					if _, exists := existingSymptomMap[compositeKey]; exists {
+						log.Info().Msgf("Symptom with eventID=%d and symptomID=%d already exists, skipping...", eReq.EventID, symptomID)
+						continue
+					}
+
+					log.Info().Msgf("Creating Symptom at index %d", i)
+
+					// Map the symptomMap to your symptom struct
+					newSymptomStruct, err := mapToSymtomStruct(symptomMap)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to map symptom")
+						return err
+					}
+
+					symptomPayload, err := json.Marshal(newSymptomStruct)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to marshal symptom payload")
+						return err
+					}
+
+					log.Info().Msgf("Final symptom JSON: %s", string(symptomPayload))
+
+					symptomURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.Itoa(int(eReq.EventID)) + "/symptom"
+					symptomRequest := utilities.ConstructRequest(string(symptomPayload), symptomURI, "POST")
+
+					response, err := utilities.MakeAPICall(symptomRequest)
+					if err != nil {
+						log.Error().AnErr("Service Error from Symptom API", err).Msgf("Failed to create symptom at index %d", i)
+					} else {
+						log.Info().Msg("Triggered Symptom API successfully. Response = " + string(response))
+					}
+				}
+
+			case "attribute":
+				log.Info().Msgf("Creating records for attribute: %s", key)
+
+				// Fetch master data map before the loop
+				attributeIDsMap, err := getAttributeIdsFromDB()
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to get attribute master data")
+					return err
+				}
+
+				// Fetch already existing event-linked attributes
+				existingAttributeMap, err := getAttributeMasterData(strconv.Itoa(int(eReq.EventID)))
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to fetch existing attributes for event")
+					return err
+				}
+
+				for i, attr := range value.([]interface{}) {
+					attrMap, ok := attr.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid attribute at index %d", i)
+						continue
+					}
+					// Extract attribute name
+					name, nameOk := attrMap["name"].(string)
+					if !nameOk || strings.TrimSpace(name) == "" {
+						log.Warn().Msgf("Missing or invalid attributeName at index %d: %+v", i, attrMap)
+						continue // Skip this attribute if name is missing or invalid
+					}
+					// Lookup attributeId from master list using the attribute name
+					attributeID, found := attributeIDsMap[name]
+					if !found {
+						log.Warn().Msgf("No matching attributeId found for name: %s at index %d", name, i)
+						continue // Skip this attribute if no matching ID is found
+					}
+					attrMap["attributeId"] = attributeID
+					attrMap["eventID"] = eReq.EventID
+
+					// Construct composite key to check for duplicates
+					compositeKey := fmt.Sprintf("%d_%d", eReq.EventID, attributeID)
+					if _, exists := existingAttributeMap[compositeKey]; exists {
+						log.Info().Msgf("Attribute with eventID=%d and attributeID=%d already exists, skipping...", eReq.EventID, attributeID)
+						continue
+					}
+
+					log.Info().Msgf("Creating Attribute at index %d", i)
+
+					newAttrStruct, err := mapToAttributeStruct(attrMap)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to map attribute")
+						return err
+					}
+
+					attributePayload, err := json.Marshal(newAttrStruct)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to marshal attribute payload")
+						return err
+					}
+
+					log.Info().Msgf("Final attribute JSON: %s", string(attributePayload))
+
+					attributeURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.Itoa(int(eReq.EventID)) + "/attribute"
+					attributeRequest := utilities.ConstructRequest(string(attributePayload), attributeURI, "POST")
+
+					response, err := utilities.MakeAPICall(attributeRequest)
+					if err != nil {
+						log.Error().AnErr("Service Error from Attribute API", err).Msgf("Failed to create attribute at index %d", i)
+					} else {
+						log.Info().Msg("Triggered Attribute API successfully. Response = " + string(response))
+					}
+				}
+
+			case "measurement":
+				log.Info().Msgf("Processing measurements for event ID: %d", eReq.EventID)
+
+				// Fetch master measurement IDs
+				measurementIDsMap, err := getMeasurementIdsFromDB()
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to get measurement master data")
+					return err
+				}
+
+				// Fetch already existing event-linked measurements to prevent duplicates
+				existingMeasurementMap, err := getEventMeasurements(strconv.Itoa(int(eReq.EventID)))
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to fetch existing measurements for event")
+					return err
+				}
+
+				for i, measurement := range value.([]interface{}) {
+					measurementMap, ok := measurement.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid measurement format at index %d: %+v", i, measurement)
+						continue
+					}
+
+					log.Debug().Msgf("Processing measurement at index %d: %+v", i, measurementMap)
+
+					// Extract measurement name
+					name, nameOk := measurementMap["name"].(string)
+					if !nameOk || strings.TrimSpace(name) == "" {
+						log.Warn().Msgf("Missing or invalid measurementName at index %d: %+v", i, measurementMap)
+						continue
+					}
+
+					// Lookup measurementId from master list using the measurement name
+					measurementID, found := measurementIDsMap[name]
+					if !found {
+						log.Warn().Msgf("No matching measurementId found for name: %s at index %d", name, i)
+						continue
+					}
+					measurementMap["measurementId"] = measurementID
+					measurementMap["eventID"] = eReq.EventID
+
+					// Check for duplicate
+					compositeKey := fmt.Sprintf("%d_%d", eReq.EventID, measurementID)
+					if _, exists := existingMeasurementMap[compositeKey]; exists {
+						log.Info().Msgf("Measurement with eventID=%d and measurementID=%d already exists, skipping...", eReq.EventID, measurementID)
+						continue
+					}
+
+					log.Info().Msgf("Creating Measurement at index %d", i)
+
+					// Convert map to struct
+					newMeasurementStruct, err := mapToMeaurementStruct(measurementMap)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to map measurement")
+						return err
+					}
+
+					measurementPayload, err := json.Marshal(newMeasurementStruct)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to marshal measurement payload")
+						return err
+					}
+
+					// Construct API call
+					measurementURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.Itoa(int(eReq.EventID)) + "/measurement"
+					measurementRequest := utilities.ConstructRequest(string(measurementPayload), measurementURI, "POST")
+
+					response, err := utilities.MakeAPICall(measurementRequest)
+					if err != nil {
+						log.Error().AnErr("Service Error from Measurement API", err).Msgf("Failed to create measurement at index %d", i)
+					} else {
+						log.Info().Msgf("Triggered Measurement API successfully for index %d. Response = %s", i, string(response))
+					}
+				}
+
+			case "maintenance":
+				log.Info().Msgf("Creating record for key: %s", key)
+				for i, maintenance := range value.([]interface{}) {
+					maintenanceMap, ok := maintenance.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid maintenance at index %d", i)
+						return errors.New("invalid maintenance at index " + strconv.Itoa(i))
+					}
+					// Add eventID to the maintenance  payload
+					maintenanceMap["eventID"] = eReq.EventID
+					maintenanceMap["entityId"] = eReq.EntityID
+
+					// Check if shopVisit already exists in the database
+					if maintenanceID, idExists := maintenanceMap["category"].(int); idExists {
+						existingMaintenance, err := dataRepo.GetMaintenanceByEventID(int(eReq.EventID), maintenanceID)
+						if err != nil {
+							log.Error().Err(err).Msgf("Failed to check existing maintenace for ID %d", maintenanceID)
+							return err
+						}
+						if existingMaintenance != nil {
+							log.Info().Msgf("maintenance with ID %d already exists, skipping...", maintenanceID)
+							continue
+						}
+					}
+
+					newMaintenanceStruct, err := mapToMaintStruct(maintenanceMap)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to map maintenance")
+						return err
+					}
+
+					// Marshal maintenance payload for the API request
+					maintenancePayload, err := json.Marshal(newMaintenanceStruct)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to marshal maintenance payload")
+						return err
+					}
+
+					// Construct the API request for maintenance
+					maintenanceURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.Itoa(int(eReq.EventID)) + "/maintenance"
+					maintenanceRequest := utilities.ConstructRequest(string(maintenancePayload), maintenanceURI, "POST")
+
+					// Make the API call
+					response, err := utilities.MakeAPICall(maintenanceRequest)
+					if err != nil {
+						log.Error().AnErr("Service Error from Maintenance API", err).Msgf("Failed to create maintenance at index %d", i)
+					} else {
+						log.Info().Msg("Triggered measurement API successfully. Response = " + string(response))
+					}
+				}
+			case "rootCause":
+				log.Info().Msgf("Processing rootcause for key: %s", key)
+				for i, rootCause := range value.([]interface{}) {
+					log.Info().Msgf("Rootcause at index %d: %v", i, rootCause)
+					rootcauseMap, ok := rootCause.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid rootcause at index %d: %v", i, rootCause)
+						return nil
+					}
+					log.Info().Msgf("RootcauseMap: %v", rootcauseMap)
+					// Add eventID to the rootcause  payload
+					rootcauseMap["eventID"] = eReq.EventID
+					rootcauseMap["entityId"] = eReq.EntityID
+
+					// Check if shopVisit already exists in the database
+					if rootCauseID, idExists := rootcauseMap[""].(int); idExists {
+						existingRootCause, err := dataRepo.GetRootCauseByEventID(int(eReq.EventID), rootCauseID)
+						if err != nil {
+							log.Error().Err(err).Msgf("Failed to check existing rootcause for ID %d", rootCauseID)
+							return err
+						}
+						if existingRootCause != nil {
+							log.Info().Msgf("rootcause with ID %d already exists, skipping...", rootCauseID)
+							continue
+						}
+					}
+					newRootcauseStruct, err := mapToRootStruct(rootcauseMap)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to map rootcause")
+						return err
+					}
+
+					// Marshal rootcause payload for the API request
+					rootcausePayload, err := json.Marshal(newRootcauseStruct)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to marshal rootcause payload")
+						return err
+					}
+
+					// Construct the API request for rootcause
+					rootcauseURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.Itoa(int(eReq.EventID)) + "/rootCause"
+					rootcauseRequest := utilities.ConstructRequest(string(rootcausePayload), rootcauseURI, "POST")
+
+					// Make the API call
+					response, err := utilities.MakeAPICall(rootcauseRequest)
+					if err != nil {
+						log.Error().AnErr("Service Error from RootCause API", err).Msgf("Failed to create rootcause at index %d", i)
+					} else {
+						log.Info().Msg("Triggered rootcause API successfully. Response = " + string(response))
+					}
+				}
+			case "disruption":
+				log.Info().Msgf("Processing disruptions for event ID: %d", eReq.EventID)
+
+				// Get the disruption IDs map from DB (keyed by name)
+				disruptionIDsMap, err := getDisruptionIdsFromDB()
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to get disruption IDs from DB")
+					return err
+				}
+
+				for i, disruption := range value.([]interface{}) {
+					disruptionMap, ok := disruption.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid disruption format at index %d", i)
+						return nil
+					}
+
+					name, nameOk := disruptionMap["name"].(string)
+					if !nameOk {
+						log.Error().Msgf("Missing name field in disruption at index %d", i)
+						return nil
+					}
+
+					key := strings.TrimSpace(name)
+
+					if id, found := disruptionIDsMap[key]; found {
+						disruptionMap["disruptionId"] = id
+					} else {
+						log.Warn().Msgf("Disruption ID not found for name '%s' at index %d", key, i)
+						continue // or return error if strict enforcement needed
+					}
+
+					disruptionMap["eventId"] = eReq.EventID
+
+					// Check for duplicate
+					if did, ok := disruptionMap["disruptionId"].(int); ok {
+						log.Debug().Msgf("Checking for existing disruption with ID %d for event ID %d", did, eReq.EventID)
+						existing, err := dataRepo.GetDisruptionByEventID(int(eReq.EventID), did)
+						if err != nil {
+							log.Error().Err(err).Msgf("Failed to check existing disruption with ID %d", did)
+							return err
+						}
+						if existing != nil {
+							log.Info().Msgf("Disruption with ID %d already exists for event %d, skipping", did, eReq.EventID)
+							continue
+						}
+					}
+
+					newDisruptionStruct, err := mapToDisrupStruct(disruptionMap)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to map disruption")
+						return err
+					}
+
+					disruptionPayload, err := json.Marshal(newDisruptionStruct)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to marshal disruption payload")
+						return err
+					}
+
+					disruptionURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.Itoa(int(eReq.EventID)) + "/disruption"
+					disruptionRequest := utilities.ConstructRequest(string(disruptionPayload), disruptionURI, "POST")
+
+					response, err := utilities.MakeAPICall(disruptionRequest)
+					if err != nil {
+						log.Error().AnErr("Service Error from Disruption API", err).Msgf("Failed to create disruption at index %d", i)
+					} else {
+						log.Info().Msgf("Triggered Disruption API successfully for index %d. Response = %s", i, string(response))
+					}
+				}
+
+			}
+		}
+	}
+
+	return nil
+}
+
+// handleUpdateRecord func process updates for events and events sub-attributes
+func handleUpdatedRecords(updated map[string]interface{}, eReq structs.EventSnapshotDetailResponse) error {
+	log.Info().Msg("Starting to process elements for event update")
+
+	// Step 1: Filter non-slice fields from the `updated` map
+	nonSliceElementMap := map[string]interface{}{}
+	for key, value := range updated {
+		if value != nil && reflect.TypeOf(value).Kind() != reflect.Slice {
+			nonSliceElementMap[key] = value
+		}
+	}
+	eventID, err := getEventID(eventNumber)
+	if err != nil {
+		log.Error().Err(err).Msgf("Failed to fetch EventID for EventNumber: %s", eReq.EventNumber)
+		return err
+	}
+	eReq.EventID = eventID
+
+	entityID, err := fetchEntityID(entitySourceKey)
+	if err != nil {
+		log.Error().AnErr("DB Error", err).Msg("Failed to fetch EntityID using EntitySourceKey")
+		return err
+	}
+	eReq.EntityID = entityID
+
+	// Step 2: Process non-slice fields (if any)
+	if len(nonSliceElementMap) > 0 {
+
+		// Convert map to struct
+		newEventStruct := mapToEventStruct(nonSliceElementMap)
+
+		newEventStruct.EventID = eventID
+		newEventStruct.EntityID = eReq.EntityID
+		newEventStruct.EventDate = eReq.EventDate
+		newEventStruct.Owner = eReq.Owner
+		newEventStruct.DataSource = eReq.DataSource
+		newEventStruct.Status = eReq.Status
+		newEventStruct.NotifiedDate = eReq.NotifiedDate
+		newEventStruct.Comment = eReq.Remark
+		newEventStruct.ReportedBy = eReq.ReportedBy
+		newEventStruct.Station = eReq.StationCode
+
+		// Check for file attachments
+		var attachments []structs.EventAttachment
+
+		if value, exists := updated["fileAttachment"]; exists {
+			log.Info().Msgf("Processing fileAttachments for event ID: %d", eReq.EventID)
+
+			//  Get existing attachments from the database
+			existingAttachments, err := getEventAttachmentDetails(strconv.Itoa(int(eReq.EventID)))
+			if err != nil {
+				log.Error().Err(err).Msgf("Failed to fetch existing attachments for eventID: %d", eventID)
+				return err
+			}
+
+			log.Info().Msgf("Fetched existing attachments for eventID: %d", eventID)
+
+			for i, attachment := range value.([]interface{}) {
+				attachmentMap, ok := attachment.(map[string]interface{})
+				if !ok {
+					log.Error().Msgf("Invalid attachment format at index %d: %+v", i, attachment)
+					continue
+				}
+				// Check for duplicate filenames
+				filename, ok := attachmentMap["fileName"].(string)
+				if !ok || filename == "" {
+					log.Error().Msgf("Missing or invalid filename at index %d: %+v", i, attachmentMap)
+					continue
+				}
+				if _, exists := existingAttachments[filename]; exists {
+					log.Warn().Msgf("Duplicate filename detected: %s for eventID: %d. Skipping file at index %d.", filename, eventID, i)
+					continue
+				}
+				// Map the attachment map to the `EventAttachment` struct
+				newAttachmentStruct, err := mapToFileAttachementStruct(attachmentMap)
+				if err != nil {
+					log.Error().Err(err).Msgf("Failed to map fileAttachment at index %d", i)
+					continue
+				}
+
+				attachments = append(attachments, newAttachmentStruct)
+			}
+
+			if len(attachments) > 0 {
+				log.Info().Interface("Processed fileAttachments for event ID", attachments)
+			}
+
+		}
+		// Marshal event payload with attachments
+		newEventStruct.FileAttachment = attachments
+
+		// Marshal event payload
+		eventPayload, err := json.Marshal(newEventStruct)
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to marshal event payload")
+			return err
+		}
+
+		log.Info().Msg("Sending event payload to API" + string(eventPayload))
+
+		// Make API call
+		eventURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.Itoa(int(eventID)) + "/withAttachments"
+		eventRequest := utilities.ConstructRequest(string(eventPayload), eventURI, "PUT")
+
+		response, err := utilities.MakeAPICall(eventRequest)
+		if err != nil {
+			log.Error().AnErr("Service Error from Events API", err).Msg("Failed to update event")
+			return err
+		}
+		log.Info().Msgf("API response: %s", string(response))
+
+		// Parse API response
+		var apiErrResp structs.APIFailure
+		if err := json.Unmarshal(response, &apiErrResp); err == nil && apiErrResp.ErrorMessage != "" {
+			log.Error().Msg("API returned an error response")
+			return fmt.Errorf("API error: %s", apiErrResp.ErrorMessage)
+		}
+		log.Info().Msgf("Event updated successfully with eventID: %d", eReq.EventID)
+		// send the EventId to subattributes
+		events, err := getEventID(eventNumber)
+		if err != nil {
+			log.Error().Err(err).Msgf("Failed to fetch eventId for eventNumber: %s", eReq.EventNumber)
+			return err
+		}
+		eReq.EventID = events
+
+		//  Fetch EntityID
+		entitySourceID, err := fetchEntityID(entitySourceKey)
+		if err != nil {
+			log.Error().AnErr("DB Error", err).Msg("Failed to fetch entity ID using EntitySourceKey")
+			return err
+		}
+		eReq.EntityID = entitySourceID
+		log.Info().Msgf("Event updated successfully with eventID: %d", eventID)
+
+	}
+
+	// Step 3: Process slice fields (e.g., shopVisit, sideEffect, etc.)
+	for key, value := range updated {
+		if reflect.TypeOf(value).Kind() == reflect.Slice {
+			log.Info().Msgf("Processing sub-events for key: %s", key)
+			switch key {
+			case "shopVisit":
+				log.Info().Msgf("Updating shopVisit records for event ID: %d", eReq.EventID)
+
+				// Step 1: Process each incoming shopVisit
+				for i, shopVisit := range value.([]interface{}) {
+					shopVisitMap, ok := shopVisit.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid shopVisit format at index %d: %+v", i, shopVisit)
+						continue // Skip invalid shopVisit and continue processing others
+					}
+					shopVisitMap["entityId"] = eReq.EntityID
+					shopVisitMap["eventID"] = eReq.EventID
+
+					log.Debug().Msgf("Processing shopVisit at index %d: %+v", i, shopVisitMap)
+
+					// Step 4: Map the shopVisit data to the appropriate struct
+					updatedShopVisitStruct, err := mapToShopVisitStruct(shopVisitMap)
+					if err != nil {
+						log.Error().Err(err).Msgf("Failed to map shopVisit at index %d", i)
+						continue // Skip this shopVisit and continue processing others
+					}
+
+					// Step 5: Marshal the struct into JSON payload
+					shopVisitPayload, err := json.Marshal(updatedShopVisitStruct)
+					if err != nil {
+						log.Error().Err(err).Msgf("Failed to marshal shopVisit payload at index %d", i)
+						continue // Skip this shopVisit and continue processing others
+					}
+
+					// Step 6: Construct API call
+					shopVisitURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.Itoa(int(eReq.EventID)) + "/shopvisit"
+					shopVisitRequest := utilities.ConstructRequest(string(shopVisitPayload), shopVisitURI, "PUT")
+
+					response, err := utilities.MakeAPICall(shopVisitRequest)
+					if err != nil {
+						log.Error().AnErr("Service Error from ShopVisit API", err).Msgf("Failed to update shopVisit at index %d", i)
+						continue // Log the error and continue processing other shopVisits
+					}
+
+					log.Info().Msgf("Triggered ShopVisit API successfully for index %d. Response = %s", i, string(response))
+				}
+			case "sideEffect":
+				log.Info().Msgf("Processing sideEffect updates for event ID: %d", eReq.EventID)
+
+				// Get the sideEffect IDs map from DB (keyed by name)
+				sideEffectIDsMap, err := getSideEffectIdsFromDB()
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to get sideEffect IDs from DB")
+					return err
+				}
+
+				//Process incoming sideEffect
+				for i, sideEffect := range value.([]interface{}) {
+					sideEffectMap, ok := sideEffect.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid sideEffect format at index %d", i)
+						return nil
+					}
+
+					name, nameOk := sideEffectMap["name"].(string)
+					if !nameOk || strings.TrimSpace(name) == "" {
+						log.Error().Msgf("Missing name field in sideEffect at index %d", i)
+						return nil
+					}
+
+					if sideEffectID, found := sideEffectIDsMap[name]; found {
+						sideEffectMap["sideEffectId"] = sideEffectID
+					} else {
+						log.Warn().Msgf("SideEffect ID not found for name '%s' at index %d", key, i)
+						continue
+					}
+
+					sideEffectMap["eventId"] = eReq.EventID
+
+					updatedSideEffectStruct, err := mapToSideEffectStruct(sideEffectMap)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to map sideEffect")
+						return err
+					}
+
+					sideEffectPayload, err := json.Marshal(updatedSideEffectStruct)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to marshal sideEffect payload")
+						return err
+					}
+					// construct the API request
+					sideEffectURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.Itoa(int(eReq.EventID)) + "/sideEffects/" + strconv.Itoa(int(updatedSideEffectStruct.ID))
+					sideEffectRequest := utilities.ConstructRequest(string(sideEffectPayload), sideEffectURI, "PUT") // Use PUT for updates
+					//make API call
+					response, err := utilities.MakeAPICall(sideEffectRequest)
+					if err != nil {
+						log.Error().AnErr("Service Error from SideEffect API", err).Msgf("Failed to update sideEffect at index %d", i)
+					}
+					log.Info().Msgf("Triggered SideEffect API successfully for update at index %d. Response = %s", i, string(response))
+				}
+
+			case "symptom":
+				log.Info().Msgf("Updating symptoms for event ID: %d", eReq.EventID)
+
+				//  Fetch master data map (category_name_modifier -> symptomId)
+				symptomIDsMap, err := getSymptomIdsFromDB()
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to get symptom master data")
+					return err
+				}
+
+				//  Process each incoming symptom
+				for i, symptom := range value.([]interface{}) {
+					symptomMap, ok := symptom.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid symptom at index %d", i)
+						continue
+					}
+
+					// Extract symptom fields
+					category, catOk := symptomMap["category"].(string)
+					name, nameOk := symptomMap["name"].(string)
+					modifier := symptomMap["modifier"] // could be float64 if from JSON
+
+					if !catOk || !nameOk || modifier == nil {
+						log.Warn().Msgf("Missing or invalid symptom fields at index %d: %+v", i, symptomMap)
+						continue // Skip this symptom if required fields are missing or invalid
+					}
+
+					// Convert modifier to int
+					var modifierInt int
+					switch v := modifier.(type) {
+					case float64:
+						modifierInt = int(v)
+					case int:
+						modifierInt = v
+					case string:
+						parsed, err := strconv.Atoi(v)
+						if err != nil {
+							log.Warn().Msgf("Invalid modifier string at index %d: %s", i, v)
+							continue // Skip this symptom if modifier is invalid
+						}
+						modifierInt = parsed
+					default:
+						log.Warn().Msgf("Invalid type for modifier at index %d: %+v", i, modifier)
+						continue // Skip this symptom if modifier type is invalid
+					}
+
+					// Lookup symptomId from master list using category, name, and modifier
+					key := fmt.Sprintf("%s_%s_%d", category, name, modifierInt)
+					symptomID, found := symptomIDsMap[key]
+					if !found {
+						log.Warn().Msgf("No matching symptomId found for key: %s at index %d", key, i)
+						continue
+					}
+
+					symptomMap["symptomId"] = symptomID
+					symptomMap["eventID"] = eReq.EventID
+
+					// Map the symptomMap to your symptom struct
+					updatedSymptomStruct, err := mapToSymtomStruct(symptomMap)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to map symptom for update")
+						return err
+					}
+
+					symptomPayload, err := json.Marshal(updatedSymptomStruct)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to marshal symptom payload for update")
+						return err
+					}
+
+					log.Info().Msgf("Final symptom JSON for update: %s", string(symptomPayload))
+					// construct the api request
+					symptomURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.Itoa(int(eReq.EventID)) + "/symptom/" + strconv.Itoa(int(updatedSymptomStruct.ID))
+					symptomRequest := utilities.ConstructRequest(string(symptomPayload), symptomURI, "PUT")
+					//make api call
+					response, err := utilities.MakeAPICall(symptomRequest)
+					if err != nil {
+						log.Error().AnErr("Service Error from Symptom API", err).Msgf("Failed to update symptom at index %d", i)
+					}
+					log.Info().Msg("Triggered Symptom API successfully for update. Response = " + string(response))
+
+				}
+
+			case "attribute":
+				log.Info().Msgf("Updating attributes for event ID: %d", eReq.EventID)
+
+				// Step 1: Fetch master data map (attribute name -> attributeId)
+				attributeIDsMap, err := getAttributeIdsFromDB()
+				if err != nil {
+					log.Printf("Failed to get attribute master data: %v", err)
+					return err
+				}
+				// Fetch already existing event-linked attributes
+				existingAttributeMap, err := getAttributeMasterData(strconv.Itoa(int(eReq.EventID)))
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to fetch existing attributes for event")
+					return err
+				}
+
+				// Step 2: Process each incoming attribute
+				for i, attr := range value.([]interface{}) {
+					attrMap, ok := attr.(map[string]interface{})
+					if !ok {
+						log.Printf("Invalid attribute at index %d", i)
+						continue
+					}
+
+					// Extract attribute name
+					name, nameOk := attrMap["name"].(string)
+					if !nameOk || strings.TrimSpace(name) == "" {
+						log.Printf("Missing or invalid attributeName at index %d: %+v", i, attrMap)
+						continue // Skip this attribute if name is missing or invalid
+					}
+
+					// Lookup attributeId from master list using the attribute name
+					attributeID, found := attributeIDsMap[name]
+					if !found {
+						log.Printf("No matching attributeId found for name: %s at index %d", name, i)
+						continue // Skip this attribute if no matching ID is found
+					}
+
+					attrMap["attributeId"] = attributeID
+					attrMap["eventID"] = eReq.EventID
+
+					// Construct composite key to check for duplicates
+					compositeKey := fmt.Sprintf("%d_%d", eReq.EventID, attributeID)
+					if _, exists := existingAttributeMap[compositeKey]; exists {
+						log.Info().Msgf("Attribute with eventID=%d and attributeID=%d already exists, skipping...", eReq.EventID, attributeID)
+						continue
+					}
+
+					// Directly proceed with update logic
+					updatedAttrStruct, err := mapToAttributeStruct(attrMap)
+					if err != nil {
+						log.Printf("Failed to map attribute for update: %v", err)
+						return err
+					}
+
+					attributePayload, err := json.Marshal(updatedAttrStruct)
+					if err != nil {
+						log.Printf("Failed to marshal attribute payload for update: %v", err)
+						return err
+					}
+
+					attributeURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.Itoa(int(eReq.EventID)) + "/attribute/" + strconv.Itoa(int(updatedAttrStruct.ID))
+					attributeRequest := utilities.ConstructRequest(string(attributePayload), attributeURI, "PUT")
+					//make API call
+					response, err := utilities.MakeAPICall(attributeRequest)
+					if err != nil {
+						log.Printf("Service Error from Attribute API: %v", err)
+						return err
+					}
+
+					log.Printf("Triggered Attribute API successfully for update. Response = %s", string(response))
+				}
+
+			case "measurement":
+				log.Info().Msgf("Updating measurements for event ID: %d", eReq.EventID)
+
+				//  Fetch master measurement IDs
+				measurementIDsMap, err := getMeasurementIdsFromDB()
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to get measurement master data")
+					return err
+				}
+
+				//  Process each incoming measurement
+				for i, measurement := range value.([]interface{}) {
+					measurementMap, ok := measurement.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid measurement format at index %d: %+v", i, measurement)
+						continue
+					}
+
+					log.Debug().Msgf("Processing measurement at index %d: %+v", i, measurementMap)
+
+					// Extract measurement name
+					name, nameOk := measurementMap["name"].(string)
+					if !nameOk || strings.TrimSpace(name) == "" {
+						log.Warn().Msgf("Missing or invalid measurementName at index %d: %+v", i, measurementMap)
+						continue
+					}
+
+					// Lookup measurementId from master list using the measurement name
+					measurementID, found := measurementIDsMap[name]
+					if !found {
+						log.Warn().Msgf("No matching measurementId found for name: %s at index %d", name, i)
+						continue
+					}
+					measurementMap["measurementId"] = measurementID
+					measurementMap["eventID"] = eReq.EventID
+
+					// Convert map to struct
+					updatedMeasurementStruct, err := mapToMeaurementStruct(measurementMap)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to map measurement for update")
+						return err
+					}
+
+					measurementPayload, err := json.Marshal(updatedMeasurementStruct)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to marshal measurement payload for update")
+						return err
+					}
+
+					// Construct API call for update
+					measurementURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.Itoa(int(eReq.EventID)) + "/measurement/" + strconv.Itoa(int(updatedMeasurementStruct.ID))
+					measurementRequest := utilities.ConstructRequest(string(measurementPayload), measurementURI, "PUT")
+					//make API call
+					response, err := utilities.MakeAPICall(measurementRequest)
+					if err != nil {
+						log.Error().AnErr("Service Error from Measurement API", err).Msgf("Failed to update measurement at index %d", i)
+					}
+					log.Info().Msgf("Triggered Measurement API successfully for update at index %d. Response = %s", i, string(response))
+				}
+
+			case "maintenance":
+				log.Info().Msgf("updating maintenance record for key: %s", key)
+				for i, maintenance := range value.([]interface{}) {
+					maintenanceMap, ok := maintenance.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid maintenance at index %d", i)
+						return nil
+					}
+					// Add eventID to the maintenance  payload
+					maintenanceMap["eventID"] = eReq.EventID
+					maintenanceMap["entityId"] = eReq.EntityID
+					newMaintenanceStruct, err := mapToMaintStruct(maintenanceMap)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to map maintenance")
+						return err
+					}
+
+					// Marshal maintenance payload for the API request
+					maintenancePayload, err := json.Marshal(newMaintenanceStruct)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to marshal maintenance payload")
+						return err
+					}
+
+					// Construct the API request for maintenance
+					maintenanceURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.Itoa(int(eReq.EventID)) + "/maintenance/" + strconv.Itoa(int(newMaintenanceStruct.ID))
+					maintenanceRequest := utilities.ConstructRequest(string(maintenancePayload), maintenanceURI, "PUT")
+
+					// Make the API call
+					response, err := utilities.MakeAPICall(maintenanceRequest)
+					if err != nil {
+						log.Error().AnErr("Service Error from Maintenance API", err).Msgf("Failed to update maintenance at index %d", i)
+						continue
+					}
+					log.Info().Msgf("Triggered Maintenace API successfully for index %d. Response = %s", i, string(response))
+
+				}
+			case "rootCause":
+				log.Info().Msgf("Processing root causes for key: %s", key)
+
+				for i, rootCause := range value.([]interface{}) {
+					log.Info().Msgf("Root cause at index %d: %v", i, rootCause)
+
+					rootcauseMap, ok := rootCause.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid root cause at index %d: %v", i, rootCause)
+						continue
+					}
+
+					log.Info().Msgf("Root cause map: %v", rootcauseMap)
+
+					// Add eventID and entityId to the root cause payload
+					rootcauseMap["eventID"] = eReq.EventID
+					rootcauseMap["entityId"] = eReq.EntityID
+
+					// Extract defectName  unique identifier for the root cause
+					defectName, defectNameOk := rootcauseMap["defectName"].(string)
+					if !defectNameOk || strings.TrimSpace(defectName) == "" {
+						log.Warn().Msgf("Missing or invalid source_key in root cause at index %d: %+v", i, rootcauseMap)
+						continue
+					}
+
+					// Map the root cause map to your root cause struct
+					updatedRootCauseStruct, err := mapToRootStruct(rootcauseMap)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to map root cause for update")
+						continue
+					}
+
+					// Marshal root cause payload for the API request
+					rootcausePayload, err := json.Marshal(updatedRootCauseStruct)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to marshal root cause payload for update")
+						continue
+					}
+
+					// Construct the API request for updating the root cause
+					rootcauseURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.Itoa(int(eReq.EventID)) + "/rootCause/" + strconv.Itoa(int(updatedRootCauseStruct.ID))
+					rootcauseRequest := utilities.ConstructRequest(string(rootcausePayload), rootcauseURI, "PUT")
+
+					// Make the API call
+					response, err := utilities.MakeAPICall(rootcauseRequest)
+					if err != nil {
+						log.Error().AnErr("Service Error from RootCause API", err).Msgf("Failed to update root cause at index %d", i)
+					}
+					log.Info().Msgf("Triggered root cause API successfully for update at index %d. Response = %s", i, string(response))
+				}
+			case "disruption":
+				log.Info().Msgf("Updating disruptions for event ID: %d", eReq.EventID)
+
+				// Get the disruption IDs map from DB (keyed by name)
+				disruptionIDsMap, err := getDisruptionIdsFromDB()
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to get disruption IDs from DB")
+					return err
+				}
+
+				for i, disruption := range value.([]interface{}) {
+					disruptionMap, ok := disruption.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid disruption format at index %d", i)
+						continue
+					}
+
+					name, nameOk := disruptionMap["name"].(string)
+					if !nameOk {
+						log.Error().Msgf("Missing name field in disruption at index %d", i)
+						continue
+					}
+
+					key := strings.TrimSpace(name)
+
+					if id, found := disruptionIDsMap[key]; found {
+						disruptionMap["disruptionId"] = id
+					} else {
+						log.Warn().Msgf("Disruption ID not found for name '%s' at index %d", key, i)
+						continue // Skip this disruption if no matching ID is found
+					}
+
+					disruptionMap["eventId"] = eReq.EventID
+
+					// Map the disruptionMap to your disruption struct
+					updatedDisruptionStruct, err := mapToDisrupStruct(disruptionMap)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to map disruption for update")
+						return err
+					}
+
+					disruptionPayload, err := json.Marshal(updatedDisruptionStruct)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to marshal disruption payload for update")
+						return err
+					}
+
+					disruptionURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.Itoa(int(eReq.EventID)) + "/disruption/" + strconv.Itoa(int(updatedDisruptionStruct.ID))
+					disruptionRequest := utilities.ConstructRequest(string(disruptionPayload), disruptionURI, "PUT")
+
+					response, err := utilities.MakeAPICall(disruptionRequest)
+					if err != nil {
+						log.Error().AnErr("Service Error from Disruption API", err).Msgf("Failed to update disruption at index %d", i)
+					}
+					log.Info().Msgf("Triggered Disruption API successfully for update at index %d. Response = %s", i, string(response))
+				}
+			}
+
+		}
+	}
+
+	return nil
+}
+
+// handleDeletedRecords func process delete for  events sub-attributes
+func handleDeletedRecords(deleted map[string]interface{}, eReq structs.EventSnapshotDetailResponse) error {
+	log.Info().Msg("Starting to process elements for events deletion")
+	// send the EventId to subattributes
+	events, err := getEventID(eventNumber)
+	if err != nil {
+		log.Error().Err(err).Msgf("Failed to fetch eventId for eventNumber: %s", eReq.EventNumber)
+		return err
+	}
+	eReq.EventID = events
+
+	for key, value := range deleted {
+		if reflect.TypeOf(value).Kind() == reflect.Slice {
+			switch key {
+			case "shopVisit":
+				log.Info().Msgf("processessing shopVisit  records for event ID: %d", eReq.EventID)
+
+				// Step 1: Process each incoming shopVisit
+				for i, shopVisit := range value.([]interface{}) {
+					shopVisitMap, ok := shopVisit.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid shopVisit format at index %d: %+v", i, shopVisit)
+						continue
+					}
+
+					shopVisitMap["eventID"] = eReq.EventID
+
+					// Construct API call
+					shopVisitURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.Itoa(int(eReq.EventID)) + "/shopvisit"
+					shopVisitRequest := utilities.ConstructRequest("", shopVisitURI, "DELETE")
+
+					response, err := utilities.MakeAPICall(shopVisitRequest)
+					if err != nil {
+						log.Error().AnErr("Service Error from ShopVisit API", err).Msgf("Failed to update shopVisit at index %d", i)
+						continue
+					}
+
+					log.Info().Msgf("Triggered ShopVisit API successfully for index %d. Response = %s", i, string(response))
+				}
+
+			case "symptom":
+				log.Info().Msgf("processessing symptoms deleteion for event ID: %d", eReq.EventID)
+
+				//  Process each incoming symptom
+				for i, symptom := range value.([]interface{}) {
+					symptomMap, ok := symptom.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid symptom format at index %d: %+v", i, symptom)
+						continue
+					}
+
+					for _, symptom := range eReq.Symptom {
+						symptomMap["id"] = symptom.ID
+						symptomMap["eventID"] = eReq.EventID
+
+						//  Construct API call
+						symptomURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.FormatInt(eReq.EventID, 10) + "/symptom/" + strconv.FormatInt(symptom.ID, 10)
+						symptomRequest := utilities.ConstructRequest("", symptomURI, "DELETE")
+						//make API call
+						response, err := utilities.MakeAPICall(symptomRequest)
+						if err != nil {
+							log.Error().AnErr("Service Error from Symptom API", err).Msgf("Failed to update symptom at index %d", i)
+							continue
+						}
+
+						log.Info().Msgf("Triggered Symptom API successfully for index %d. Response = %s", i, string(response))
+					}
+				}
+
+			case "attribute":
+				log.Info().Msgf("processessing attributes deleteion for event ID: %d", eReq.EventID)
+
+				// Process each incoming attribute
+				for i, attribute := range value.([]interface{}) {
+					attributeMap, ok := attribute.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid attribute format at index %d: %+v", i, attribute)
+						continue
+					}
+					for _, attribute := range eReq.Attributes {
+						attributeMap["id"] = attribute.ID
+
+						log.Info().Msgf("fetching the attribute id , Response = %s", attributeMap["id"])
+
+						attributeMap["eventId"] = eReq.EventID
+
+						// Construct API call
+						attributeURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.FormatInt(eReq.EventID, 10) + "/attribute/" + strconv.FormatInt(attribute.ID, 10)
+
+						attributeRequest := utilities.ConstructRequest("", attributeURI, "DELETE")
+
+						response, err := utilities.MakeAPICall(attributeRequest)
+						if err != nil {
+							log.Error().AnErr("Service Error from Attribute API", err).Msgf("Failed to delete attribute at index %d", i)
+							continue
+						}
+
+						log.Info().Msgf("Triggered Attribute API successfully for index %d. Response = %s", i, string(response))
+					}
+				}
+
+			case "measurement":
+				log.Info().Msgf("Processessing  measurements  deletion for event ID: %d", eReq.EventID)
+
+				// Process each incoming measurement
+				for i, measurement := range value.([]interface{}) {
+					measurementMap, ok := measurement.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid measurement format at index %d: %+v", i, measurement)
+						continue
+					}
+					for _, measurement := range eReq.Measurement {
+						measurementMap["id"] = measurement.ID
+
+						measurementMap["eventID"] = eReq.EventID
+
+						// Construct API call
+						measurementURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.FormatInt(eReq.EventID, 10) + "/measurement/" + strconv.FormatInt(measurement.ID, 10)
+						measurementRequest := utilities.ConstructRequest("", measurementURI, "DELETE")
+
+						response, err := utilities.MakeAPICall(measurementRequest)
+						if err != nil {
+							log.Error().AnErr("Service Error from Measurement API", err).Msgf("Failed to update measurement at index %d", i)
+							continue
+						}
+
+						log.Info().Msgf("Triggered Measurement API successfully for index %d. Response = %s", i, string(response))
+					}
+				}
+
+			case "maintenance":
+				log.Info().Msgf("processessing maintenance deleteion record for event ID: %d", eReq.EventID)
+				for i, maintenance := range value.([]interface{}) {
+					maintenanceMap, ok := maintenance.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid maintenance at index %d", i)
+						return nil
+					}
+					for _, maintenance := range eReq.Maintenance {
+						maintenanceMap["id"] = maintenance.ID
+						maintenanceMap["eventID"] = eReq.EventID
+
+						// Construct the API request for maintenance
+						maintenanceURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.FormatInt(eReq.EventID, 10) + "/maintenance/" + strconv.FormatInt(maintenance.ID, 10)
+						maintenanceRequest := utilities.ConstructRequest("", maintenanceURI, "DELETE")
+
+						// Make the API call
+						response, err := utilities.MakeAPICall(maintenanceRequest)
+						if err != nil {
+							log.Error().AnErr("Service Error from Maintenance API", err).Msgf("Failed to update maintenance at index %d", i)
+							continue
+						}
+						log.Info().Msgf("Triggered Maintenace API successfully for index %d. Response = %s", i, string(response))
+					}
+				}
+			case "rootcause":
+				log.Info().Msgf("processessing  rootcause deletion record for event ID: %d", eReq.EventID)
+				for i, rootcause := range value.([]interface{}) {
+					rootcauseMap, ok := rootcause.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid rootcause at index %d", i)
+						return nil
+					}
+					for _, rootcause := range eReq.RootCause {
+						rootcauseMap["id"] = rootcause.ID
+						rootcauseMap["eventID"] = eReq.EventID
+
+						// Construct the API request for rootcause
+						rootcauseURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.FormatInt(eReq.EventID, 10) + "/rootcause/" + strconv.FormatInt(rootcause.ID, 10)
+						rootcauseRequest := utilities.ConstructRequest("", rootcauseURI, "DELETE")
+
+						// Make the API call
+						response, err := utilities.MakeAPICall(rootcauseRequest)
+						if err != nil {
+							log.Error().AnErr("Service Error from RootCause API", err).Msgf("Failed to create rootcause at index %d", i)
+							continue
+						}
+						log.Info().Msgf("Triggered Rootcause API successfully for index %d. Response = %s", i, string(response))
+					}
+				}
+			case "disruption":
+				log.Info().Msgf("processessing disruptions deleteion for  event ID: %d", eReq.EventID)
+
+				//  Process each incoming disruption
+				for i, disruption := range value.([]interface{}) {
+					disruptionMap, ok := disruption.(map[string]interface{})
+					if !ok {
+						log.Error().Msgf("Invalid disruption format at index %d: %+v", i, disruption)
+						continue
+					}
+					for _, disruption := range eReq.Disruption {
+						disruptionMap["id"] = disruption.ID
+						disruptionMap["eventID"] = eReq.EventID
+
+						//  Construct API call
+						disruptionURI := os.Getenv("EVENT_REQUEST_BASE_URL") + "/api/v1/events/" + strconv.FormatInt(eReq.EventID, 10) + "/disruption/" + strconv.FormatInt(disruption.ID, 10)
+						disruptionRequest := utilities.ConstructRequest("", disruptionURI, "DELETE")
+
+						// make API call
+						response, err := utilities.MakeAPICall(disruptionRequest)
+						if err != nil {
+							log.Error().AnErr("Service Error from Disruption API", err).Msgf("Failed to update disruption at index %d", i)
+							continue
+						}
+
+						log.Info().Msgf("Triggered Disruption API successfully for index %d. Response = %s", i, string(response))
+					}
+				}
+
+			}
+		}
+	}
+	return nil
+
+}
+
+// getSymptomsMasterData gets db values from symptom tables
+func getSymptomsMasterData(eventID string) (map[string]int64, error) {
+	var err error
+	var symptomDetails []map[string]interface{}
+	if len(eventID) > 0 {
+		symptomDetails, err = dataRepo.GetSymptoms(eventID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	dbMap := make(map[string]int64)
+	for _, dbValue := range symptomDetails {
+		if dbValue["event_id"] != nil && dbValue["symptom_id"] != nil {
+			dbMap[dbValue["event_id"].(string)+dbValue["symptom_id"].(string)] = dbValue["id"].(int64)
+		}
+	}
+	return dbMap, nil
+}
+
+// getSymptomIdsFromDB gets db values from symptom table
+func getSymptomIdsFromDB() (map[string]int64, error) {
+	var err error
+	var symptomIDs []map[string]interface{}
+	symptomIDs, err = dataRepo.GetSymptomIDs()
+	if err != nil {
+		return nil, err
+	}
+	dbMap := make(map[string]int64)
+	for _, dbValue := range symptomIDs {
+		if dbValue["symptom_category"] != nil && dbValue["symptom_name"] != nil && dbValue["symptom_modifier_code"] != nil {
+			key := fmt.Sprintf("%s_%s_%v", dbValue["symptom_category"], dbValue["symptom_name"], dbValue["symptom_modifier_code"])
+			dbMap[key] = dbValue["id"].(int64)
+		}
+	}
+	return dbMap, nil
+}
+
+// getSideEffectsMasterData gets db values from sideEffect tables
+func getSideEffectsMasterData(eventID string) (map[string]int64, error) {
+	var err error
+	var sideEffectDetails []map[string]interface{}
+	if len(eventID) > 0 {
+		sideEffectDetails, err = dataRepo.GetEventSideEffects(eventID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	dbMap := make(map[string]int64)
+	for _, dbValue := range sideEffectDetails {
+		if dbValue["event_id"] != nil && dbValue["side_effect_id"] != nil {
+			dbMap[dbValue["event_id"].(string)+dbValue["side_effect_id"].(string)] = dbValue["id"].(int64)
+		}
+	}
+	return dbMap, nil
+}
+
+// getSideEffectIdsFromDB gets db values from sideEffect table
+func getSideEffectIdsFromDB() (map[string]int64, error) {
+	var err error
+	var sideEffectIDs []map[string]interface{}
+	sideEffectIDs, err = dataRepo.GetSideEffectIDs()
+	if err != nil {
+		return nil, err
+	}
+	dbMap := make(map[string]int64)
+	for _, dbValue := range sideEffectIDs {
+		if name, ok := dbValue["lookup_name"].(string); ok {
+			dbMap[strings.TrimSpace(name)] = dbValue["id"].(int64)
+		}
+	}
+	return dbMap, nil
+}
+
+// getEventDisruptions return disruption associated with event
+func getEventDisruptions(eventID string) (map[string]int64, error) {
+	var err error
+	var eventDisruptions []map[string]interface{}
+	if len(eventID) > 0 {
+		eventDisruptions, err = dataRepo.GetEventDisruptions(eventID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	dbMap := make(map[string]int64)
+	for _, dbValue := range eventDisruptions {
+		if dbValue["event_id"] != nil && dbValue["disruption_id"] != nil {
+			dbMap[dbValue["event_id"].(string)+dbValue["disruption_id"].(string)] = dbValue["id"].(int64)
+		}
+	}
+	return dbMap, nil
+}
+
+// getDisruptionIdsFromDB gets ids for all the disruptions from master list
+func getDisruptionIdsFromDB() (map[string]int64, error) {
+	var err error
+	var disruptionIDs []map[string]interface{}
+	disruptionIDs, err = dataRepo.GetDisruptionIDs()
+	if err != nil {
+		return nil, err
+	}
+	dbMap := make(map[string]int64)
+	for _, dbValue := range disruptionIDs {
+		if dbValue["disruption_name"] != nil {
+			key := fmt.Sprintf("%s", dbValue["disruption_name"])
+			dbMap[key] = dbValue["id"].(int64)
+		}
+	}
+	return dbMap, nil
+}
+
+// getEventAttachmentDetails gets ids for all the disruptions from master list
+func getEventAttachmentDetails(eventID string) (map[string]int64, error) {
+	var err error
+	var fileIDs []map[string]interface{}
+	if len(eventID) > 0 {
+		fileIDs, err = dataRepo.GetEventAttachmentDetails(eventID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	dbMap := make(map[string]int64)
+	for _, dbValue := range fileIDs {
+		if dbValue["event_id"] != nil && dbValue["file_name"] != nil {
+			dbMap[dbValue["event_id"].(string)+dbValue["file_name"].(string)] = dbValue["id"].(int64)
+		}
+	}
+	return dbMap, nil
+
+}
+
+// getEventMeasurements return measurements associated with event
+func getEventMeasurements(eventID string) (map[string]int64, error) {
+	var err error
+	var eventMeasurements []map[string]interface{}
+	if len(eventID) > 0 {
+		eventMeasurements, err = dataRepo.GetEventMeasurements(eventID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	dbMap := make(map[string]int64)
+	for _, dbValue := range eventMeasurements {
+		if dbValue["event_id"] != nil && dbValue["measurement_id"] != nil {
+			dbMap[dbValue["event_id"].(string)+dbValue["measurement_id"].(string)] = dbValue["id"].(int64)
+		}
+	}
+	return dbMap, nil
+}
+
+// getMeasurementIdsFromDB gets ids for all the measurements from master list
+func getMeasurementIdsFromDB() (map[string]int64, error) {
+	var err error
+	var measurementIDs []map[string]interface{}
+	measurementIDs, err = dataRepo.GetMeasurementIDs()
+	if err != nil {
+		return nil, err
+	}
+	dbMap := make(map[string]int64)
+	for _, dbValue := range measurementIDs {
+		if dbValue["measurement_name"] != nil {
+			key := fmt.Sprintf("%s", dbValue["measurement_name"])
+			dbMap[key] = dbValue["id"].(int64)
+		}
+	}
+	return dbMap, nil
+}
+
+// getAttributeMasterData gets db values from Attribute tables
+func getAttributeMasterData(eventID string) (map[string]int64, error) {
+	var err error
+	var attributeDetails []map[string]interface{}
+	if len(eventID) > 0 {
+		attributeDetails, err = dataRepo.GetEventAttributes(eventID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	dbMap := make(map[string]int64)
+	for _, dbValue := range attributeDetails {
+		if dbValue["event_id"] != nil && dbValue["attribute_id"] != nil {
+			dbMap[dbValue["event_id"].(string)+"_"+dbValue["attribute_id"].(string)] = dbValue["id"].(int64)
+		}
+	}
+	return dbMap, nil
+}
+
+// getAttributeIdsFromDB gets db values from Attribute table
+func getAttributeIdsFromDB() (map[string]int64, error) {
+	var err error
+	var attributeIDs []map[string]interface{}
+	attributeIDs, err = dataRepo.GetEventAttributeIDs()
+	if err != nil {
+		return nil, err
+	}
+	dbMap := make(map[string]int64)
+	for _, dbValue := range attributeIDs {
+		if dbValue["attributename"] != nil {
+			key := fmt.Sprintf("%s", dbValue["attributename"])
+			dbMap[key] = dbValue["id"].(int64)
+		}
+	}
+	return dbMap, nil
+}
+
+func getEventID(eventNumber string) (int64, error) {
+	// Fetch event ID using EventNumber
+	dbResponse, err := dataRepo.GetEventIDByNumber(eventNumber)
+	if err != nil {
+		log.Error().AnErr("DB Error", err).Msg("Failed to fetch event ID for Event number: %s" + eventNumber)
+		return 0, err
+	}
+
+	var eventID int64
+	eventID, ok := dbResponse["id"].(int64)
+	if !ok {
+		return 0, errors.New("Failed to parse event ID from database response")
+	}
+	log.Info().Msgf("eventID: %v", eventID)
+	return eventID, nil
+}
+
+func fetchEntityID(entitySourceKey string) (int64, error) {
+	entityIDMap, err := dataRepo.GetEntityByID(entitySourceKey)
+	if err != nil {
+		return 0, err
+	}
+
+	idValue, exists := entityIDMap["id"]
+	if !exists {
+		return 0, fmt.Errorf("entity ID not found")
+	}
+
+	entityID, ok := idValue.(int64)
+	if !ok {
+		return 0, fmt.Errorf("entity ID type assertion failed")
+	}
+
+	return entityID, nil
+}
+
+func mapToEventStruct(eventMap map[string]interface{}) structs.EventResponse {
+
+	eventJSON, err := json.Marshal(eventMap)
+	if err != nil {
+		log.Error().Interface("eventMap", eventMap).Err(err).Msg("Error in marshaling created eventMap")
+		return structs.EventResponse{}
+	}
+	log.Info().Str("MappedEventJson", string(eventJSON)).Msg("Converted created map to json")
+
+	var evt structs.EventResponse
+	err = json.Unmarshal(eventJSON, &evt)
+	if err != nil {
+		log.Error().Err(err).Msg("Error in unmarshal to eventResponse")
+	}
+
+	return evt
+}
+
+func mapToShopVisitStruct(eventMap interface{}) (structs.ShopVisit, error) {
+	eventJSON, err := json.Marshal(eventMap)
+	if err != nil {
+		fmt.Println("Error in marshal")
+	}
+
+	var eventShopVisit structs.ShopVisit
+
+	err = json.Unmarshal(eventJSON, &eventShopVisit)
+	if err != nil {
+		fmt.Println("Error in unmarshal")
+	}
+
+	return eventShopVisit, nil
+}
+func mapToSideEffectStruct(eventMap interface{}) (structs.SideEffect, error) {
+	eventJSON, err := json.Marshal(eventMap)
+	if err != nil {
+		fmt.Println("Error in marshal")
+	}
+
+	var eventSideEffect structs.SideEffect
+
+	err = json.Unmarshal(eventJSON, &eventSideEffect)
+	if err != nil {
+		fmt.Println("Error in unmarshal")
+	}
+
+	return eventSideEffect, nil
+}
+func mapToMaintStruct(eventMap interface{}) (structs.Maintenance, error) {
+	eventJSON, err := json.Marshal(eventMap)
+	if err != nil {
+		fmt.Println("Error in marshal")
+	}
+
+	var eventMaint structs.Maintenance
+
+	err = json.Unmarshal(eventJSON, &eventMaint)
+	if err != nil {
+		fmt.Println("Error in unmarshal")
+	}
+
+	return eventMaint, nil
+}
+func mapToMeaurementStruct(eventMap interface{}) (structs.Measurement, error) {
+	eventJSON, err := json.Marshal(eventMap)
+	if err != nil {
+		fmt.Println("Error in marshal")
+	}
+
+	var eventMeasure structs.Measurement
+
+	err = json.Unmarshal(eventJSON, &eventMeasure)
+	if err != nil {
+		fmt.Println("Error in unmarshal")
+	}
+
+	return eventMeasure, nil
+}
+func mapToSymtomStruct(eventMap interface{}) (structs.Symptom, error) {
+	eventJSON, err := json.Marshal(eventMap)
+	if err != nil {
+		fmt.Println("Error in marshal")
+	}
+
+	var eventSympt structs.Symptom
+
+	err = json.Unmarshal(eventJSON, &eventSympt)
+	if err != nil {
+		fmt.Println("Error in unmarshal")
+	}
+
+	return eventSympt, nil
+}
+func mapToRootStruct(eventMap interface{}) (structs.RootCause, error) {
+	eventJSON, err := json.Marshal(eventMap)
+	if err != nil {
+		fmt.Println("Error in marshal")
+	}
+
+	var eventRoot structs.RootCause
+
+	err = json.Unmarshal(eventJSON, &eventRoot)
+	if err != nil {
+		fmt.Println("Error in unmarshal")
+	}
+
+	return eventRoot, nil
+}
+
+func mapToDisrupStruct(eventMap interface{}) (structs.Disruption, error) {
+	eventJSON, err := json.Marshal(eventMap)
+	if err != nil {
+		fmt.Println("Error in marshal")
+	}
+
+	var eventDisruption structs.Disruption
+
+	err = json.Unmarshal(eventJSON, &eventDisruption)
+	if err != nil {
+		fmt.Println("Error in unmarshal")
+	}
+
+	return eventDisruption, nil
+}
+func mapToAttributeStruct(eventMap interface{}) (structs.Attribute, error) {
+	eventJSON, err := json.Marshal(eventMap)
+	if err != nil {
+		fmt.Println("Error in marshal")
+	}
+
+	var eventAttribute structs.Attribute
+
+	err = json.Unmarshal(eventJSON, &eventAttribute)
+	if err != nil {
+		fmt.Println("Error in unmarshal")
+	}
+
+	return eventAttribute, nil
+}
+
+func mapToFileAttachementStruct(eventMap interface{}) (structs.EventAttachment, error) {
+	eventJSON, err := json.Marshal(eventMap)
+	if err != nil {
+		fmt.Println("Error in marshal")
+	}
+
+	var eventAttachement structs.EventAttachment
+
+	err = json.Unmarshal(eventJSON, &eventAttachement)
+	if err != nil {
+		fmt.Println("Error in unmarshal")
+	}
+
+	return eventAttachement, nil
+}
